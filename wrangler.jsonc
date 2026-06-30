@@ -27,6 +27,6 @@
   // Non-secret vars. PARTYKIT_SECRET is set as a secret via `wrangler secret put`.
   // TODO(deploy): set APP_URL to your production Vercel URL before `wrangler deploy`.
   "vars": {
-    "APP_URL": "https://YOUR-VERCEL-APP.vercel.app"
+    "APP_URL": "https://inkwell-weld.vercel.app"
   }
 }

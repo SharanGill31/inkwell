@@ -14,6 +14,7 @@
     "test:watch": "vitest",
     "dev:party": "wrangler dev",
     "deploy:party": "wrangler deploy",
+    "deploy:vercel": "vercel --prod",
     "typecheck:party": "tsc -p tsconfig.worker.json --noEmit"
   },
   "dependencies": {
@@ -60,6 +61,7 @@
     "eslint-config-next": "16.2.9",
     "tailwindcss": "^4",
     "typescript": "^5",
+    "vercel": "^54.18.5",
     "vitest": "^4.1.9",
     "wrangler": "^4"
   }
