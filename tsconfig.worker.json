@@ -1,0 +1,16 @@
+{
+  // Separate type-check config for the Cloudflare Worker code under party/.
+  // Uses @cloudflare/workers-types globals (DurableObjectState, ExportedHandler,
+  // Cloudflare.Env, fetch, Request/Response/WebSocket…) WITHOUT the DOM lib that
+  // the Next.js tsconfig carries — DOM and workers-types otherwise collide on
+  // global Request/Response/WebSocket declarations. party/ is excluded from the
+  // main tsconfig; run `npm run typecheck:party` to check it.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["esnext"],
+    "types": ["@cloudflare/workers-types"],
+    "noEmit": true
+  },
+  "include": ["party/**/*.ts"],
+  "exclude": ["node_modules"]
+}

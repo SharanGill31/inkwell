@@ -1,0 +1,32 @@
+{
+  // Cloudflare Workers deploy manifest for the Inkwell realtime room.
+  // Replaces partykit.json. The room (party/index.ts) is a partyserver Durable
+  // Object deployed directly via `wrangler deploy`.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "inkwell",
+  "main": "party/worker.ts",
+  "compatibility_date": "2025-09-23",
+  "observability": {
+    "enabled": true
+  },
+
+  // One Durable Object per document. Binding `Main` → kebab `main` → matches the
+  // y-partyserver client default route `/parties/main/{room}` (zero client change).
+  "durable_objects": {
+    "bindings": [
+      { "name": "Main", "class_name": "Document" }
+    ]
+  },
+
+  // Free-plan Cloudflare requires SQLite-backed Durable Objects (not KV-backed),
+  // hence `new_sqlite_classes`. This is what partykit 0.0.115 could not provide.
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Document"] }
+  ],
+
+  // Non-secret vars. PARTYKIT_SECRET is set as a secret via `wrangler secret put`.
+  // TODO(deploy): set APP_URL to your production Vercel URL before `wrangler deploy`.
+  "vars": {
+    "APP_URL": "https://YOUR-VERCEL-APP.vercel.app"
+  }
+}

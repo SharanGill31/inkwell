@@ -5,7 +5,8 @@ import type * as Y from 'yjs'
 import { getRoomToken } from '@/server/actions/documents'
 
 export function usePartyProvider(doc: Y.Doc, documentId: string) {
-  const host = process.env.NEXT_PUBLIC_PARTYKIT_HOST ?? '127.0.0.1:1999'
+  // wrangler dev serves the Worker on :8787 (partykit used :1999).
+  const host = process.env.NEXT_PUBLIC_PARTYKIT_HOST ?? '127.0.0.1:8787'
 
   const provider = useYProvider({
     host,

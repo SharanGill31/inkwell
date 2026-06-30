@@ -29,8 +29,10 @@ export async function POST(
     .setExpirationTime('30s')
     .sign(getSecret())
 
-  const partyHost = process.env.NEXT_PUBLIC_PARTYKIT_HOST ?? '127.0.0.1:1999'
-  const roomRes = await fetch(`http://${partyHost}/party/${id}?action=restore`, {
+  // partyserver routes HTTP requests to the room via /parties/{namespace}/{name};
+  // binding `Main` kebabs to `main`, so the restore endpoint is /parties/main/{id}.
+  const partyHost = process.env.NEXT_PUBLIC_PARTYKIT_HOST ?? '127.0.0.1:8787'
+  const roomRes = await fetch(`http://${partyHost}/parties/main/${id}?action=restore`, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${token}`,

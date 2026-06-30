@@ -44,3 +44,5 @@ next-env.d.ts
 .next/
 node_modules/
 .env.local
+.dev.vars
+.wrangler/

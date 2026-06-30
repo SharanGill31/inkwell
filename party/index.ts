@@ -1,4 +1,4 @@
-import type * as Party from 'partykit/server'
+import { Server, type Connection, type ConnectionContext } from 'partyserver'
 import { jwtVerify, SignJWT } from 'jose'
 import * as Y from 'yjs'
 import * as syncProtocol from 'y-protocols/sync'
@@ -20,23 +20,32 @@ const SYNC_STEP1 = 0 // read: client sends its state vector, server replies with
 
 type ConnState = { role: 'owner' | 'editor' | 'viewer' }
 
-function getRole(conn: Party.Connection): 'owner' | 'editor' | 'viewer' | null {
+/** Bindings/env this Durable Object reads at runtime. Must match wrangler.jsonc + party/worker.ts. */
+export type RoomEnv = {
+  PARTYKIT_SECRET: string
+  APP_URL?: string
+}
+
+function getRole(conn: Connection): 'owner' | 'editor' | 'viewer' | null {
   return (conn.state as ConnState | null)?.role ?? null
 }
 
-function safeSend(conn: Party.Connection, msg: Uint8Array) {
+function safeSend(conn: Connection, msg: Uint8Array) {
   if (conn.readyState !== WS_CONNECTING && conn.readyState !== WS_OPEN) return
   try { conn.send(msg) } catch {}
 }
 
-export default class Document implements Party.Server {
+// Platform adapter: extends partyserver's Server (Cloudflare DurableObject) instead of
+// partykit/server's Party.Server. Only the adapter surface changed — the Yjs sync protocol,
+// viewer write-gating, debounced Postgres persistence, and non-destructive restore below
+// are byte-identical to the PartyKit version.
+export default class Document extends Server<RoomEnv> {
   private doc = new Y.Doc()
   private awareness: awarenessProtocol.Awareness
   // conn.id → awareness client IDs controlled by that connection
   private connAwarenessIds = new Map<string, number[]>()
-  // Cached room id — set once in onStart() where this.room.id is safe to read.
-  // Every other handler uses this.docId so they never touch this.room.id after
-  // an async resume point (forbidden when an alarm is concurrently in-flight).
+  // Cached room name — set once in onStart() where this.name is safe to read.
+  // Every other handler uses this.docId so they never need to re-resolve the name.
   private docId = ''
   // Resolves once the saved Y.Doc state has been fetched from Postgres and applied.
   // onConnect awaits this before syncing so the first client never races an empty doc.
@@ -45,18 +54,18 @@ export default class Document implements Party.Server {
   // Wall-clock timestamp of the last auto-snapshot (resets on room restart — acceptable).
   private lastAutoSnapshotAt = 0
 
-  constructor(readonly room: Party.Room) {
+  constructor(ctx: DurableObjectState, env: RoomEnv) {
+    super(ctx, env)
     this.awareness = new awarenessProtocol.Awareness(this.doc)
     this.awareness.setLocalState(null)
-    // docId and loadedPromise are initialised in onStart() where this.room.id is safe.
   }
 
   // ─── Postgres helpers ─────────────────────────────────────────────────────
 
   private async mintRoomToken(docId: string): Promise<string> {
-    const rawSecret = this.room.env.PARTYKIT_SECRET
+    const rawSecret = this.env.PARTYKIT_SECRET
     if (!rawSecret) throw new Error('PARTYKIT_SECRET not configured')
-    const secret = new TextEncoder().encode(rawSecret as string)
+    const secret = new TextEncoder().encode(rawSecret)
     return new SignJWT({ sub: 'room', doc: docId, role: 'room' })
       .setProtectedHeader({ alg: 'HS256' })
       .setExpirationTime('30s')
@@ -64,7 +73,7 @@ export default class Document implements Party.Server {
   }
 
   private appUrl(): string {
-    return (this.room.env.APP_URL as string | undefined) ?? 'http://localhost:3000'
+    return this.env.APP_URL ?? 'http://localhost:3000'
   }
 
   private async loadFromPostgres(docId: string): Promise<void> {
@@ -122,9 +131,9 @@ export default class Document implements Party.Server {
   // setAlarm is called on every doc update in onStart; each call resets the
   // 2-second window, so this only fires after 2 s of editing silence.
   async onAlarm() {
-    // this.room.id is forbidden inside onAlarm (PartyKit limitation).
-    // The id was persisted to storage in onStart() so we can safely read it here.
-    const docId = this.docId || ((await this.room.storage.get<string>('docId')) ?? '')
+    // this.name is available inside onAlarm in partyserver; the storage fallback covers
+    // the rare case where onStart hasn't populated this.docId yet.
+    const docId = this.docId || ((await this.ctx.storage.get<string>('docId')) ?? '')
     if (!docId) { console.error('[Document] onAlarm: docId missing from storage'); return }
 
     await this.saveToPostgres(docId)
@@ -196,7 +205,7 @@ export default class Document implements Party.Server {
   }
 
   // ─── HTTP handler (non-WebSocket requests to the room) ───────────────────
-  async onRequest(req: Party.Request): Promise<Response> {
+  async onRequest(req: Request): Promise<Response> {
     const url = new URL(req.url)
     const action = url.searchParams.get('action')
 
@@ -207,9 +216,9 @@ export default class Document implements Party.Server {
       if (!token) return new Response('Unauthorized', { status: 401 })
 
       try {
-        const rawSecret = this.room.env.PARTYKIT_SECRET
+        const rawSecret = this.env.PARTYKIT_SECRET
         if (!rawSecret) return new Response('Unauthorized', { status: 401 })
-        const secret = new TextEncoder().encode(rawSecret as string)
+        const secret = new TextEncoder().encode(rawSecret)
         const { payload } = await jwtVerify(token, secret)
         if (payload.role !== 'room' || payload.doc !== this.docId)
           return new Response('Forbidden', { status: 403 })
@@ -229,44 +238,20 @@ export default class Document implements Party.Server {
     return new Response('Not Found', { status: 404 })
   }
 
-  // ─── Edge worker layer ────────────────────────────────────────────────────
-  // Runs before the Durable Object is involved. Rejects unknown callers here
-  // so they never touch the room state.
-  static async onBeforeConnect(
-    req: Party.Request,
-    lobby: Party.Lobby,
-  ): Promise<Party.Request | Response> {
-    try {
-      const token = new URL(req.url).searchParams.get('token')
-      if (!token) return new Response('Unauthorized', { status: 401 })
-
-      const rawSecret = lobby.env.PARTYKIT_SECRET
-      if (!rawSecret) {
-        console.error('[onBeforeConnect] PARTYKIT_SECRET missing from lobby.env')
-        return new Response('Unauthorized', { status: 401 })
-      }
-
-      const secret = new TextEncoder().encode(rawSecret as string)
-      const { payload } = await jwtVerify(token, secret)
-      // Token must be scoped to this exact room (room name === documentId)
-      if (payload.doc !== lobby.id) return new Response('Forbidden', { status: 403 })
-      return req
-    } catch (err) {
-      console.error('[onBeforeConnect] error:', err)
-      return new Response('Unauthorized', { status: 401 })
-    }
-  }
+  // NOTE: the edge JWT gate (PartyKit's static onBeforeConnect) now lives in
+  // party/worker.ts, passed to routePartykitRequest(). It rejects unknown callers
+  // before the Durable Object is touched.
 
   // ─── Durable Object layer ─────────────────────────────────────────────────
   // Verify the token a second time (defence in depth) and store the role so
   // onMessage can enforce read-only without re-parsing the token on every message.
-  async onConnect(conn: Party.Connection, ctx: Party.ConnectionContext) {
+  async onConnect(conn: Connection, ctx: ConnectionContext) {
     const token = new URL(ctx.request.url).searchParams.get('token') ?? ''
-    const rawSecret = this.room.env.PARTYKIT_SECRET
+    const rawSecret = this.env.PARTYKIT_SECRET
     if (!rawSecret) { conn.close(4500, 'Server misconfigured'); return }
 
     try {
-      const secret = new TextEncoder().encode(rawSecret as string)
+      const secret = new TextEncoder().encode(rawSecret)
       const { payload } = await jwtVerify(token, secret)
       if (payload.doc !== this.docId) { conn.close(4003, 'Forbidden'); return }
       conn.setState({ role: payload.role as ConnState['role'] })
@@ -300,11 +285,9 @@ export default class Document implements Party.Server {
   }
 
   onStart() {
-    // this.room.id is safe to read here. Cache it so every other handler uses
-    // this.docId and never touches this.room.id after an async resume point
-    // (which is forbidden when an alarm is concurrently in-flight).
-    this.docId = this.room.id
-    this.room.storage.put('docId', this.docId).catch(console.error)
+    // this.name is safe to read here. Cache it so every other handler uses this.docId.
+    this.docId = this.name
+    this.ctx.storage.put('docId', this.docId).catch(console.error)
     this.loadedPromise = this.loadFromPostgres(this.docId)
 
     // Broadcast Y.Doc updates to all connections and schedule a debounced Postgres save.
@@ -313,9 +296,9 @@ export default class Document implements Party.Server {
       encoding.writeVarUint(encoder, MESSAGE_SYNC)
       syncProtocol.writeUpdate(encoder, update)
       const msg = encoding.toUint8Array(encoder)
-      for (const conn of this.room.getConnections()) safeSend(conn, msg)
+      for (const conn of this.getConnections()) safeSend(conn, msg)
       // Reset the alarm window on every edit — fires saveToPostgres after 2 s of silence.
-      this.room.storage.setAlarm(Date.now() + 2000).catch(console.error)
+      this.ctx.storage.setAlarm(Date.now() + 2000).catch(console.error)
       console.log('[Document] alarm scheduled (+2s)')
     })
 
@@ -334,7 +317,7 @@ export default class Document implements Party.Server {
           'id' in (origin as object)
 
         if (isConnectionOrigin) {
-          const connId = (origin as Party.Connection).id
+          const connId = (origin as Connection).id
           const ids = new Set(this.connAwarenessIds.get(connId) ?? [])
           for (const id of added) ids.add(id)
           for (const id of removed) ids.delete(id)
@@ -349,13 +332,15 @@ export default class Document implements Party.Server {
             awarenessProtocol.encodeAwarenessUpdate(this.awareness, changedClients),
           )
           const msg = encoding.toUint8Array(encoder)
-          for (const conn of this.room.getConnections()) safeSend(conn, msg)
+          for (const conn of this.getConnections()) safeSend(conn, msg)
         }
       },
     )
   }
 
-  onMessage(message: string | ArrayBuffer | ArrayBufferView, sender: Party.Connection) {
+  // NOTE: partyserver calls onMessage(connection, message) — connection first.
+  // (PartyKit used onMessage(message, sender); only the parameter order changed.)
+  onMessage(sender: Connection, message: string | ArrayBuffer | ArrayBufferView) {
     if (typeof message === 'string') return
 
     const data =
@@ -399,7 +384,7 @@ export default class Document implements Party.Server {
           encoding.writeVarUint(encoder, MESSAGE_AWARENESS)
           encoding.writeVarUint8Array(encoder, awarenessData)
           const msg = encoding.toUint8Array(encoder)
-          for (const conn of this.room.getConnections()) safeSend(conn, msg)
+          for (const conn of this.getConnections()) safeSend(conn, msg)
           break
         }
       }
@@ -408,7 +393,7 @@ export default class Document implements Party.Server {
     }
   }
 
-  onClose(conn: Party.Connection) {
+  onClose(conn: Connection) {
     const ids = this.connAwarenessIds.get(conn.id) ?? []
     if (ids.length > 0) {
       // Fires awareness 'update' with origin=null → event handler broadcasts the removal
@@ -417,10 +402,10 @@ export default class Document implements Party.Server {
     this.connAwarenessIds.delete(conn.id)
 
     // When the last connection closes, save immediately and cancel the pending alarm.
-    // This ensures state is written to Postgres before the Durable Object hibernates,
+    // This ensures state is written to Postgres before the Durable Object is evicted,
     // even if the 2-second alarm window hasn't elapsed yet.
-    if ([...this.room.getConnections()].length === 0) {
-      this.room.storage.deleteAlarm().catch(console.error)
+    if ([...this.getConnections()].length === 0) {
+      this.ctx.storage.deleteAlarm().catch(console.error)
       this.saveToPostgres(this.docId).catch(console.error)
     }
   }
