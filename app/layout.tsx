@@ -27,7 +27,30 @@ export default function RootLayout({
       lang="en"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body className="min-h-full flex flex-col">
+        <div className="flex-1">{children}</div>
+        <footer className="mt-auto border-t border-border py-4 text-center text-sm text-muted-foreground">
+          <span>Sharandeep Kaur</span>
+          {" · "}
+          <a
+            href="https://github.com/SharanGill31"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="underline hover:text-foreground"
+          >
+            GitHub
+          </a>
+          {" · "}
+          <a
+            href="https://linkedin.com/in/sharan-gill-b07a57273"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="underline hover:text-foreground"
+          >
+            LinkedIn
+          </a>
+        </footer>
+      </body>
     </html>
   );
 }
